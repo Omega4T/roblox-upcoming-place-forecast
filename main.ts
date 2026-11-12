@@ -70,7 +70,7 @@ function rankBucket(r: number): number {
 }
 
 function bucketOf(h: number): number {
-  return Math.min(Math.floor((h - 1) / 6), NBUCK - 1);
+  return Math.max(0, Math.min(Math.floor((h - 1) / 6), NBUCK - 1));
 }
 
 /** log-normal kernel over the ten places, unnormalised. */
@@ -108,6 +108,7 @@ function buildCounts(snaps: Snapshot[]): number[][][][] {
     for (let j = i + 1; j < snaps.length; j++) {
       const b = snaps[j]!;
       const h = (b.at - a.at) / 3.6e6;
+      if (!(h > 0)) continue;   // same-timestamp or out-of-order reads carry no transition
       if (h > 72) break;
       const bk = bucketOf(h);
       for (const [g, r0] of a.rank) {
