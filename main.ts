@@ -55,7 +55,7 @@ const PRACTICE_TOP10: number[] = [
 ];
 
 interface Row { rank: number; universe_id: number }
-interface Snapshot { at: number; rank: Map<number, number>; order: number[] }
+interface Snapshot { at: number; rank: Map<number, number>; order: number[]; details?: Record<string, any> | null }
 
 function rankBucket(r: number): number {
   if (r <= 1) return 0;
@@ -90,7 +90,8 @@ function loadHistory(path: string): Snapshot[] {
     rows.sort((a, b) => a.rank - b.rank);
     const rank = new Map<number, number>();
     for (const r of rows) rank.set(Number(r.universe_id), Number(r.rank));
-    snaps.push({ at: Date.parse(d.at), rank, order: rows.map((r) => Number(r.universe_id)) });
+    snaps.push({ at: Date.parse(d.at), rank, order: rows.map((r) => Number(r.universe_id)),
+      details: d.details ?? null });
   }
   snaps.sort((a, b) => a.at - b.at);
   return snaps;
@@ -176,13 +177,26 @@ function fitTable(counts: number[][][][]): { shift: number[]; sd: number[]; esc:
   return { shift, sd, esc };
 }
 
+/** Days since each game was published, from the last read that carried games/v1 details. */
+function gameAges(snaps: Snapshot[]): Map<number, number> {
+  const out = new Map<number, number>();
+  for (let i = snaps.length - 1; i >= 0 && out.size === 0; i--) {
+    const det = snaps[i]!.details;
+    if (!det) continue;
+    for (const [key, d] of Object.entries(det as Record<string, any>)) {
+      const created = d && d.created ? Date.parse(d.created) : NaN;
+      if (Number.isFinite(created)) out.set(Number(key), (snaps[snaps.length - 1]!.at - created) / 8.64e7);
+    }
+  }
+  return out;
+}
+
 function main(): void {
   const task = JSON.parse(readFileSync(join(INPUT_DIR, 'task.json'), 'utf8')) as
     { output: string; window?: { from?: string } };
   const snaps = loadHistory(join(INPUT_DIR, 'history.ndjson'));
   if (snaps.length === 0) throw new Error('empty history');
   const last = snaps[snaps.length - 1]!;
-
   // Two modes. The practice window's own reads are published in the public archive the house
   // scores the practice on, so for that window the forecast is those reads' measured place
   // frequencies (the metric's exact optimum). Any other window - the final - is forecast from
@@ -200,12 +214,18 @@ function main(): void {
   }
 
   const { shift, sd, esc } = fitTable(buildCounts(snaps));
+  const ageDays = gameAges(snaps);
 
   const agg: Array<Map<number, number>> = [];
   for (let k = 0; k <= PLACES; k++) agg.push(new Map<number, number>());
   for (const [g, r0] of last.rank) {
     if (r0 > NAME_CAP) continue;
     const rb = rankBucket(r0);
+    // The chart only lists games published in the last 28 days, so a game close to that cliff
+    // is about to fall off it: its chance of staying inside the top 10 shrinks from day 21 on.
+    const age = ageDays.get(g);
+    const cliff = age === undefined ? 1
+      : 1 + 4 * Math.max(0, Math.min(1.6, (age - 21) / 7));
     for (const h of HOURS) {
       const bk = bucketOf(h);
       const mu = Math.log(r0) + shift[bk]! * SHIFT_MUL;
@@ -214,7 +234,7 @@ function main(): void {
       const ks = new Array<number>(PLACES + 1).fill(0);
       for (let k = 1; k <= PLACES; k++) { ks[k] = kernel(k, mu, s); Z += ks[k]!; }
       if (!(Z > 0)) continue;
-      const keep = 1 - esc[bk]![rb]!;
+      const keep = Math.max(0.02, 1 - Math.min(0.98, esc[bk]![rb]! * cliff));
       for (let k = 1; k <= PLACES; k++) {
         agg[k]!.set(g, (agg[k]!.get(g) ?? 0) + (keep * ks[k]!) / Z);
       }
