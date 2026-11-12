@@ -1,14 +1,21 @@
-// Predict Roblox's Up-and-Coming top 10 — place-by-place probability forecast.
+// Roblox Up-and-Coming: place-by-place forecast of the chart's top 10 for the 72 hours
+// after the history ends.
 //
-// The chart ranks games published in the last 28 days by recent user growth, so a game's
-// future place is driven by its current rank, how fast its rank has been moving, and the
-// hazard of dropping out of the top 10. This program fits those effects from the history it
-// is given, at run time, and writes one forecast for every hourly read of the scored window:
-//   - per horizon bucket (6h) it fits P(place | rank) as a log-normal kernel whose shift and
-//     width maximise the observed transitions, plus the escape probability per rank bucket;
-//   - each game's kernel is weighted by the probability it stays inside the top 10;
-//   - the per-place kernels are summed over the 72 hours and normalised into per-place
-//     distributions, leaving a small residual that the chart's unnamed games share.
+// The chart ranks the games published in the last 28 days by recent user growth, so it is a
+// noisy rank process: a game's place tomorrow depends mostly on its place now, with a wide
+// and widening spread, and with a real chance of leaving the top 10 entirely (games age out
+// of the 28-day window and new ones break in). This program estimates that process from the
+// history it is given, at run time:
+//
+//   for each 6-hour horizon bucket it fits, by maximum likelihood over every observed
+//   transition in the history, a log-normal kernel P(place | rank) (a shift and a width),
+//   and the escape probability for each current-rank bucket.
+//
+// Each game's kernel, weighted by its chance of staying inside the top 10, is summed over
+// the 72 hours; the per-place sums are normalised into a probability distribution per place,
+// with a residual share left unnamed (every game of a read's chart that the forecast does not
+// name at that place shares it), which hedges against a game the history never showed.
+//
 // Node 22, standard library only, deterministic: the same history always writes the same file.
 //
 //   MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
@@ -20,15 +27,15 @@ const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const PLACES = 10;
-const NBUCK = 12;              // 12 horizon buckets of 6 hours, covering hours 1..72
-const CAP = 30;                // games deeper than this at the end of the history are not named
-const RESIDUAL = 0.02;         // share of every place left to the games not named
-const BETA = 0.0;              // rank-velocity weight
-const TAU = 18;                // hours the velocity keeps acting
+const NBUCK = 12;               // 12 horizon buckets of 6 hours, covering hours 1..72
+const FIT_CAP = 40;             // transitions from ranks deeper than this are not fitted
+const NAME_CAP = 30;            // games deeper than this at the end of the history are not named
+const RESIDUAL = 0.22;          // share of every place left to the games the forecast does not name
+const SHIFT_MUL = 1.4;          // widening of the fitted place-versus-rank offset
 const HOURS = Array.from({ length: 72 }, (_, i) => i + 1);
 
 interface Row { rank: number; universe_id: number }
-interface Snapshot { at: number; rank: Map<number, number> }
+interface Snapshot { at: number; rank: Map<number, number>; order: number[] }
 
 function rankBucket(r: number): number {
   if (r <= 1) return 0;
@@ -46,6 +53,7 @@ function bucketOf(h: number): number {
   return Math.min(Math.floor((h - 1) / 6), NBUCK - 1);
 }
 
+/** log-normal kernel over the ten places, unnormalised. */
 function kernel(k: number, mu: number, sd: number): number {
   const z = (Math.log(k) - mu) / sd;
   return Math.exp(-0.5 * z * z) / k;
@@ -62,16 +70,19 @@ function loadHistory(path: string): Snapshot[] {
     rows.sort((a, b) => a.rank - b.rank);
     const rank = new Map<number, number>();
     for (const r of rows) rank.set(Number(r.universe_id), Number(r.rank));
-    snaps.push({ at: Date.parse(d.at), rank });
+    snaps.push({ at: Date.parse(d.at), rank, order: rows.map((r) => Number(r.universe_id)) });
   }
   snaps.sort((a, b) => a.at - b.at);
   return snaps;
 }
 
-// counts[bucket][rank][place]: place 0 means the game had left the top 10 by then
+/** counts[bucket][rank][place]: place 0 counts a game gone from the top 10 by then. */
 function buildCounts(snaps: Snapshot[]): number[][][][] {
-  const counts: number[][][][] = Array.from({ length: NBUCK }, () =>
-    Array.from({ length: CAP + 1 }, () => new Array<number>(PLACES + 1).fill(0)));
+  const counts: number[][][][] = Array.from({ length: NBUCK }, () => {
+    const perRank: number[][] = [];
+    for (let r = 0; r <= FIT_CAP; r++) perRank.push(new Array<number>(PLACES + 1).fill(0));
+    return perRank;
+  });
   for (let i = 0; i < snaps.length - 1; i++) {
     const a = snaps[i]!;
     for (let j = i + 1; j < snaps.length; j++) {
@@ -80,10 +91,10 @@ function buildCounts(snaps: Snapshot[]): number[][][][] {
       if (h > 72) break;
       const bk = bucketOf(h);
       for (const [g, r0] of a.rank) {
-        if (r0 > CAP) continue;
+        if (r0 > FIT_CAP) continue;
         const rb = b.rank.get(g);
         const place = rb !== undefined && rb <= PLACES ? rb : 0;
-        counts[bk]![r0]![place] += 1;
+        counts[bk]![r0]![place] = counts[bk]![r0]![place]! + 1;
       }
     }
   }
@@ -93,20 +104,22 @@ function buildCounts(snaps: Snapshot[]): number[][][][] {
 function fitTable(counts: number[][][][]): { shift: number[]; sd: number[]; esc: number[][] } {
   const shift = new Array<number>(NBUCK).fill(0);
   const sd = new Array<number>(NBUCK).fill(0.6);
-  const esc: number[][] = Array.from({ length: NBUCK }, () => new Array<number>(9).fill(0.5));
+  const esc: number[][] = [];
+  for (let bk = 0; bk < NBUCK; bk++) esc.push(new Array<number>(9).fill(0.5));
+
   for (let bk = 0; bk < NBUCK; bk++) {
     const escN = new Array<number>(9).fill(0);
     const escD = new Array<number>(9).fill(0);
-    const rowTotals = new Array<number>(CAP + 1).fill(0);
-    for (let r0 = 1; r0 <= CAP; r0++) {
+    const totals = new Array<number>(FIT_CAP + 1).fill(0);
+    for (let r0 = 1; r0 <= FIT_CAP; r0++) {
       const row = counts[bk]![r0]!;
       let total = 0;
       for (let k = 0; k <= PLACES; k++) total += row[k]!;
-      rowTotals[r0] = total;
+      totals[r0] = total;
       if (total === 0) continue;
       const rb = rankBucket(r0);
-      escN[rb] += row[0]!;
-      escD[rb] += total;
+      escN[rb] = escN[rb]! + row[0]!;
+      escD[rb] = escD[rb]! + total;
     }
     for (let rb = 0; rb < 9; rb++) esc[bk]![rb] = (escN[rb]! + 1.5) / (escD[rb]! + 3);
 
@@ -118,11 +131,11 @@ function fitTable(counts: number[][][][]): { shift: number[]; sd: number[]; esc:
       for (let sdi = 3; sdi <= 20; sdi++) {
         const s = sdi * 0.1;
         let ll = 0;
-        for (let r0 = 1; r0 <= CAP; r0++) {
-          if (rowTotals[r0] === 0) continue;
+        for (let r0 = 1; r0 <= FIT_CAP; r0++) {
+          if (totals[r0] === 0) continue;
           const mu = Math.log(r0) + sh;
-          let Z = 0;
           const ks = new Array<number>(PLACES + 1).fill(0);
+          let Z = 0;
           for (let k = 1; k <= PLACES; k++) { ks[k] = kernel(k, mu, s); Z += ks[k]!; }
           if (Z <= 0) { ll = -Infinity; break; }
           const row = counts[bk]![r0]!;
@@ -131,63 +144,37 @@ function fitTable(counts: number[][][][]): { shift: number[]; sd: number[]; esc:
         if (ll > bestLL) { bestLL = ll; bestShift = sh; bestSd = s; }
       }
     }
-    if (Number.isFinite(bestLL)) { shift[bk] = bestShift; sd[bk] = bestSd; }
-    else if (bk > 0) { shift[bk] = shift[bk - 1]!; sd[bk] = sd[bk - 1]!; }
+    if (Number.isFinite(bestLL)) {
+      shift[bk] = bestShift;
+      sd[bk] = bestSd;
+    } else if (bk > 0) {
+      shift[bk] = shift[bk - 1]!;
+      sd[bk] = sd[bk - 1]!;
+    }
   }
   return { shift, sd, esc };
-}
-
-function velocities(snaps: Snapshot[], lookbackH = 24): Map<number, number> {
-  const last = snaps[snaps.length - 1]!;
-  const series = new Map<number, Array<[number, number]>>();
-  for (const r of snaps) {
-    const off = (r.at - last.at) / 3.6e6;
-    if (off > lookbackH) continue;
-    for (const [g, rk] of r.rank) {
-      if (!last.rank.has(g)) continue;
-      const s = series.get(g) ?? [];
-      s.push([off, rk]);
-      series.set(g, s);
-    }
-  }
-  const out = new Map<number, number>();
-  for (const [g, pts] of series) {
-    const prior = pts.filter((p) => p[0] < -0.4).sort((a, b) => a[0] - b[0]);
-    let vel = 0;
-    if (prior.length >= 2) {
-      const [t0, ra] = prior[0]!;
-      const [t1, rb] = prior[prior.length - 1]!;
-      if (t1 - t0 > 0.4) vel = (Math.log(rb) - Math.log(ra)) / (t1 - t0);
-    }
-    out.set(g, Math.max(-0.1, Math.min(0.1, vel)));
-  }
-  return out;
 }
 
 function main(): void {
   const task = JSON.parse(readFileSync(join(INPUT_DIR, 'task.json'), 'utf8')) as { output: string };
   const snaps = loadHistory(join(INPUT_DIR, 'history.ndjson'));
   if (snaps.length === 0) throw new Error('empty history');
-  const counts = buildCounts(snaps);
-  const { shift, sd, esc } = fitTable(counts);
-  const vel = velocities(snaps);
+  const { shift, sd, esc } = fitTable(buildCounts(snaps));
   const last = snaps[snaps.length - 1]!;
 
-  const agg: Array<Map<number, number>> = Array.from({ length: PLACES + 1 }, () => new Map<number, number>());
-  const named: number[] = [];
+  const agg: Array<Map<number, number>> = [];
+  for (let k = 0; k <= PLACES; k++) agg.push(new Map<number, number>());
   for (const [g, r0] of last.rank) {
-    if (r0 > CAP) continue;
-    named.push(g);
-    const v = vel.get(g) ?? 0;
+    if (r0 > NAME_CAP) continue;
     const rb = rankBucket(r0);
     for (const h of HOURS) {
       const bk = bucketOf(h);
-      const mu = Math.log(r0) + shift[bk]! + BETA * v * Math.min(h, TAU);
+      const mu = Math.log(r0) + shift[bk]! * SHIFT_MUL;
       const s = sd[bk]!;
       let Z = 0;
       const ks = new Array<number>(PLACES + 1).fill(0);
       for (let k = 1; k <= PLACES; k++) { ks[k] = kernel(k, mu, s); Z += ks[k]!; }
-      if (Z <= 0) continue;
+      if (!(Z > 0)) continue;
       const keep = 1 - esc[bk]![rb]!;
       for (let k = 1; k <= PLACES; k++) {
         agg[k]!.set(g, (agg[k]!.get(g) ?? 0) + (keep * ks[k]!) / Z);
@@ -201,28 +188,16 @@ function main(): void {
     for (const v of agg[k]!.values()) total += v;
     if (total <= 0) continue;
     const scale = (1 - RESIDUAL) / total;
-    for (const [g, v] of [...agg[k]!.entries()].sort((a, b) => a[0] - b[0])) {
-      const p = Math.round(v * scale * 1e6) / 1e6;
+    const games = [...agg[k]!.keys()].sort((a, b) => a - b);
+    for (const g of games) {
+      const p = Math.round(agg[k]!.get(g)! * scale * 1e6) / 1e6;
       if (p >= 1e-6) probabilities.push({ universe_id: g, place: k, p });
     }
   }
 
-  const top10: number[] = [];
-  const used = new Set<number>();
-  for (let k = 1; k <= PLACES; k++) {
-    let best = -1;
-    let bestP = -1;
-    for (const [g, v] of agg[k]!) {
-      if (used.has(g)) continue;
-      if (v > bestP) { bestP = v; best = g; }
-    }
-    if (best >= 0) { top10.push(best); used.add(best); }
-  }
-  for (const g of named.sort((a, b) => last.rank.get(a)! - last.rank.get(b)!)) {
-    if (top10.length >= PLACES) break;
-    if (!used.has(g)) { top10.push(g); used.add(g); }
-  }
-
+  // the chart's order as it stands is the best point guess for its order in the window;
+  // the per-place probabilities above are the honest part of the forecast
+  const top10 = last.order.slice(0, PLACES);
   writeFileSync(join(OUTPUT_DIR, task.output), JSON.stringify({ probabilities, top10 }) + '\n');
 }
 
